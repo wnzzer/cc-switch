@@ -310,6 +310,8 @@ pub struct CopilotAuthManager {
     refresh_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
     /// Copilot Token 缓存（key = GitHub user ID，内存缓存，自动刷新）
     copilot_tokens: Arc<RwLock<HashMap<String, CopilotToken>>>,
+    /// 模型 vendor 缓存（model_id → vendor），由 fetch_models 填充
+    model_vendor_cache: Arc<RwLock<HashMap<String, String>>>,
     /// HTTP 客户端
     http_client: Client,
     /// 存储路径
@@ -330,6 +332,7 @@ impl CopilotAuthManager {
             default_account_id: Arc::new(RwLock::new(None)),
             refresh_locks: Arc::new(RwLock::new(HashMap::new())),
             copilot_tokens: Arc::new(RwLock::new(HashMap::new())),
+            model_vendor_cache: Arc::new(RwLock::new(HashMap::new())),
             http_client: Client::new(),
             storage_path,
             pending_migration: Arc::new(RwLock::new(None)),
@@ -675,7 +678,42 @@ impl CopilotAuthManager {
 
         log::info!("[CopilotAuth] 获取到 {} 个可用模型", models.len());
 
+        // 更新模型 vendor 缓存
+        {
+            let mut cache = self.model_vendor_cache.write().await;
+            for m in &models {
+                cache.insert(m.id.clone(), m.vendor.clone());
+            }
+        }
+
         Ok(models)
+    }
+
+    /// 判断指定模型是否为 OpenAI vendor（需要走 /v1/responses 端点）
+    ///
+    /// 优先查缓存，缓存未命中时尝试从 API 获取并填充缓存。
+    pub async fn is_openai_vendor_model(&self, model_id: &str) -> bool {
+        {
+            let cache = self.model_vendor_cache.read().await;
+            if let Some(vendor) = cache.get(model_id) {
+                return vendor == "openai";
+            }
+        }
+
+        if let Some(default_id) = self.resolve_default_account_id().await {
+            if let Ok(models) = self.fetch_models_for_account(&default_id).await {
+                let cache = self.model_vendor_cache.read().await;
+                if let Some(vendor) = cache.get(model_id) {
+                    return vendor == "openai";
+                }
+                let found = models.iter().any(|m| m.id == model_id && m.vendor == "openai");
+                if found {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// 获取 Copilot 可用模型列表（向后兼容：使用第一个账号）

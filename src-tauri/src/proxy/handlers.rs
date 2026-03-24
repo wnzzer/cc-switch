@@ -25,9 +25,12 @@ use super::{
     ProxyError,
 };
 use crate::app_config::AppType;
+use crate::commands::CopilotAuthState;
+use crate::proxy::providers::copilot_auth::CopilotAuthManager;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bytes::Bytes;
 use serde_json::{json, Value};
+use tauri::Manager;
 
 // ============================================================================
 // 健康检查和状态查询（简单端点）
@@ -103,11 +106,44 @@ pub async fn handle_messages(
 
     // Claude 特有：格式转换处理
     if needs_transform {
-        return handle_claude_transform(response, &ctx, &state, &body, is_stream).await;
+        let force_responses = is_copilot_openai_vendor(&ctx.provider, &state, &ctx.request_model).await;
+        return handle_claude_transform(response, &ctx, &state, &body, is_stream, force_responses).await;
     }
 
     // 通用响应处理（透传模式）
     process_response(response, &ctx, &state, &CLAUDE_PARSER_CONFIG).await
+}
+
+/// 检查 Copilot provider 的请求模型是否为 OpenAI vendor
+async fn is_copilot_openai_vendor(
+    provider: &crate::provider::Provider,
+    state: &ProxyState,
+    request_model: &str,
+) -> bool {
+    let is_copilot = provider
+        .meta
+        .as_ref()
+        .and_then(|m| m.provider_type.as_deref())
+        == Some("github_copilot")
+        || provider
+            .settings_config
+            .get("base_url")
+            .and_then(|v| v.as_str())
+            .map(|u| u.contains("githubcopilot.com"))
+            .unwrap_or(false);
+
+    if !is_copilot {
+        return false;
+    }
+
+    if let Some(app_handle) = &state.app_handle {
+        let copilot_state = app_handle.state::<CopilotAuthState>();
+        let copilot_auth: tokio::sync::RwLockReadGuard<'_, CopilotAuthManager> =
+            copilot_state.0.read().await;
+        return copilot_auth.is_openai_vendor_model(request_model).await;
+    }
+
+    false
 }
 
 /// Claude 格式转换处理（独有逻辑）
@@ -119,9 +155,14 @@ async fn handle_claude_transform(
     state: &ProxyState,
     _original_body: &Value,
     is_stream: bool,
+    force_responses: bool,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
-    let api_format = get_claude_api_format(&ctx.provider);
+    let api_format = if force_responses {
+        "openai_responses"
+    } else {
+        get_claude_api_format(&ctx.provider)
+    };
 
     if is_stream {
         // 根据 api_format 选择流式转换器

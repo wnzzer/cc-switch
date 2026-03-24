@@ -803,10 +803,31 @@ impl RequestForwarder {
             .and_then(|m| m.provider_type.as_deref())
             == Some("github_copilot")
             || base_url.contains("githubcopilot.com");
+
+        // Copilot OpenAI vendor 模型需要走 /v1/responses 端点
+        let copilot_uses_responses = if is_copilot {
+            let model_id = body
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            if let Some(app_handle) = &self.app_handle {
+                let copilot_state = app_handle.state::<CopilotAuthState>();
+                let copilot_auth = copilot_state.0.read().await;
+                copilot_auth.is_openai_vendor_model(model_id).await
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let effective_endpoint =
             if needs_transform && adapter.name() == "Claude" && endpoint == "/v1/messages" {
-                if is_copilot {
-                    // GitHub Copilot uses /chat/completions without /v1 prefix
+                if copilot_uses_responses {
+                    // Copilot OpenAI vendor 模型 → /v1/responses
+                    "/v1/responses"
+                } else if is_copilot {
+                    // GitHub Copilot 其他模型使用 /chat/completions（无 /v1 前缀）
                     "/chat/completions"
                 } else {
                     // 根据 api_format 选择目标端点
@@ -833,7 +854,19 @@ impl RequestForwarder {
 
         // 转换请求体（如果需要）
         let request_body = if needs_transform {
-            adapter.transform_request(mapped_body, provider)?
+            if copilot_uses_responses {
+                let cache_key = provider
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.prompt_cache_key.as_deref())
+                    .unwrap_or(&provider.id);
+                super::providers::transform_responses::anthropic_to_responses(
+                    mapped_body,
+                    Some(cache_key),
+                )?
+            } else {
+                adapter.transform_request(mapped_body, provider)?
+            }
         } else {
             mapped_body
         };
